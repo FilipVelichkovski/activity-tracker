@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Activity Tracker — Apps &amp; Opened Files</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #171a23;
+      --surface-2: #1f2430;
+      --border: #2a3040;
+      --text: #e6e9ef;
+      --muted: #9aa3b2;
+      --accent: #6aa6ff;
+      --accent-2: #50d890;
+      --warn: #f5b971;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .title-group h1 { margin: 0; font-size: 1.2rem; font-weight: 600; }
+    .subtitle { color: var(--muted); font-size: 0.85rem; }
+    .live-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      font-size: 0.85rem;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--accent-2);
+    }
+    .dot.paused { background: var(--warn); }
+    .dot.idle { background: var(--muted); }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px 24px 48px;
+      display: grid;
+      gap: 20px;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    select, input, button {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 0.9rem;
+    }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .card .label { color: var(--muted); font-size: 0.8rem; }
+    .card .value { font-size: 1.4rem; font-weight: 600; margin-top: 4px; }
+    section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      overflow-x: auto;
+    }
+    section h2 {
+      margin: 0 0 12px;
+      font-size: 1rem;
+      font-weight: 600;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    th { color: var(--muted); font-weight: 500; }
+    .bar-wrap {
+      width: 140px;
+      height: 8px;
+      background: var(--surface-2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--accent);
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+      word-break: break-all;
+    }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-group">
+      <h1>Activity Tracker</h1>
+      <div class="subtitle">Active, non-minimized applications &amp; opened files (KDE Wayland + DBus + XBEL)</div>
+    </div>
+    <div class="live-pill" id="live-pill">
+      <span class="dot idle" id="live-dot"></span>
+      <span id="live-text">Connecting...</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="controls">
+      <select id="days">
+        <option value="0" selected>Today</option>
+        <option value="7">Last 7 days</option>
+        <option value="30">Last 30 days</option>
+      </select>
+      <input id="app-filter" type="text" placeholder="Filter by app name..." />
+      <button id="refresh-btn">Refresh</button>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="label">Total Active Time</div>
+        <div class="value" id="stat-time">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Applications Used</div>
+        <div class="value" id="stat-apps">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Opened Files Recorded</div>
+        <div class="value" id="stat-files">-</div>
+      </div>
+    </div>
+
+    <section>
+      <h2>Time by Category</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Time</th>
+            <th>Share</th>
+            <th>Sessions</th>
+            <th>Apps</th>
+          </tr>
+        </thead>
+        <tbody id="categories-body"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Time Spent by Application</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Application</th>
+            <th>Time</th>
+            <th>Share</th>
+            <th>Sessions</th>
+            <th>Files</th>
+          </tr>
+        </thead>
+        <tbody id="apps-body"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Websites Visited</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Domain / Site</th>
+            <th>Source</th>
+            <th>Page Title &amp; URL</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="sites-body"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Opened Files</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Application</th>
+            <th>Source</th>
+            <th>File Path</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="files-body"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Recent Active Sessions</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Started</th>
+            <th>Duration</th>
+            <th>Application</th>
+            <th>Window Title</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    function fmtDur(sec) {
+      const t = Math.round(sec || 0);
+      const h = Math.floor(t / 3600);
+      const m = Math.floor((t % 3600) / 60);
+      const s = t % 60;
+      if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+      if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+      return `${s}s`;
+    }
+    function fmtTs(ts) {
+      if (!ts) return '-';
+      return new Date(ts * 1000).toLocaleString();
+    }
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s ?? '';
+      return d.innerHTML;
+    }
+
+    async function loadStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const st = await res.json();
+        const dot = document.getElementById('live-dot');
+        const txt = document.getElementById('live-text');
+        if (st.paused) {
+          dot.className = 'dot paused';
+          txt.textContent = 'Paused by user';
+        } else if (st.screen_locked) {
+          dot.className = 'dot paused';
+          txt.textContent = 'Paused (Screen locked)';
+        } else if (st.current_app) {
+          dot.className = 'dot';
+          txt.textContent = `Tracking: ${st.current_app} (${fmtDur(st.current_duration_sec)})`;
+        } else {
+          dot.className = 'dot idle';
+          txt.textContent = 'Idle (No active non-minimized window)';
+        }
+      } catch {
+        document.getElementById('live-text').textContent = 'Offline (viewing historical DB)';
+      }
+    }
+
+    async function loadData() {
+      const days = document.getElementById('days').value;
+      const app = document.getElementById('app-filter').value.trim();
+      const q = new URLSearchParams({ days, file_limit: '100' });
+      if (app) q.set('app', app);
+
+      const [repRes, sessRes] = await Promise.all([
+        fetch(`/api/report?${q.toString()}`),
+        fetch('/api/sessions?limit=30')
+      ]);
+      const rep = await repRes.json();
+      const sessions = await sessRes.json();
+
+      const total = rep.apps.reduce((acc, a) => acc + (a.total_sec || 0), 0);
+      document.getElementById('stat-time').textContent = fmtDur(total);
+      document.getElementById('stat-apps').textContent = rep.apps.length;
+      document.getElementById('stat-files').textContent = rep.files.length;
+
+      const catsBody = document.getElementById('categories-body');
+      catsBody.innerHTML = (rep.categories && rep.categories.length) ? rep.categories.map(c => {
+        const pct = total > 0 ? (c.total_sec / total * 100) : 0;
+        return `<tr>
+          <td><strong>${esc(c.category)}</strong></td>
+          <td>${fmtDur(c.total_sec)}</td>
+          <td>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <div class="bar-wrap"><div class="bar" style="width:${pct.toFixed(1)}%"></div></div>
+              <span class="muted">${pct.toFixed(1)}%</span>
+            </div>
+          </td>
+          <td>${c.session_count}</td>
+          <td>${c.app_count}</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="5" class="muted">No categorized sessions in this period.</td></tr>';
+
+      const appsBody = document.getElementById('apps-body');
+      appsBody.innerHTML = rep.apps.length ? rep.apps.map(a => {
+        const pct = total > 0 ? (a.total_sec / total * 100) : 0;
+        return `<tr>
+          <td><strong>${esc(a.app_name)}</strong></td>
+          <td>${fmtDur(a.total_sec)}</td>
+          <td>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <div class="bar-wrap"><div class="bar" style="width:${pct.toFixed(1)}%"></div></div>
+              <span class="muted">${pct.toFixed(1)}%</span>
+            </div>
+          </td>
+          <td>${a.session_count}</td>
+          <td>${a.file_count}</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="5" class="muted">No active window sessions in this period.</td></tr>';
+
+      const sitesBody = document.getElementById('sites-body');
+      sitesBody.innerHTML = (rep.sites && rep.sites.length) ? rep.sites.map(s => `<tr>
+        <td><strong>${esc(s.domain)}</strong></td>
+        <td><span class="badge">${esc(s.source)}</span></td>
+        <td>
+          <div>${esc(s.page_title)}</div>
+          ${s.url ? `<div class="mono muted">${esc(s.url)}</div>` : ''}
+        </td>
+        <td class="muted">${fmtTs(s.last_seen_at)}</td>
+      </tr>`).join('') : '<tr><td colspan="4" class="muted">No websites recorded in this period.</td></tr>';
+
+      const filesBody = document.getElementById('files-body');
+      filesBody.innerHTML = rep.files.length ? rep.files.map(f => `<tr>
+        <td>${esc(f.app_name)}</td>
+        <td><span class="badge">${esc(f.source)}</span></td>
+        <td class="mono">${esc(f.file_path)}</td>
+        <td class="muted">${fmtTs(f.last_seen_at)}</td>
+      </tr>`).join('') : '<tr><td colspan="4" class="muted">No opened files recorded in this period.</td></tr>';
+
+      const sessBody = document.getElementById('sessions-body');
+      sessBody.innerHTML = sessions.length ? sessions.map(s => `<tr>
+        <td class="muted">${fmtTs(s.started_at)}</td>
+        <td>${fmtDur(s.duration_sec)}</td>
+        <td>${esc(s.app_name)}</td>
+        <td>${esc(s.window_title)}</td>
+      </tr>`).join('') : '<tr><td colspan="4" class="muted">No sessions recorded yet.</td></tr>';
+    }
+
+    document.getElementById('days').addEventListener('change', loadData);
+    document.getElementById('refresh-btn').addEventListener('click', () => { loadStatus(); loadData(); });
+    document.getElementById('app-filter').addEventListener('input', () => {
+      clearTimeout(window._fltTimer);
+      window._fltTimer = setTimeout(loadData, 200);
+    });
+
+    loadStatus();
+    loadData();
+    setInterval(loadStatus, 5000);
+    setInterval(loadData, 15000);
+  </script>
+</body>
+</html>

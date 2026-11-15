@@ -1,0 +1,20 @@
+[package]
+name = "activity-tracker"
+version = "0.2.0"
+edition = "2024"
+description = "KDE Wayland active (non-minimized) window & opened file tracker using KWin, DBus, XBEL, and /proc fallback"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+ksni = "0.3"
+lz4_flex = "0.11"
+notify = "7"
+quick-xml = "0.37"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+zbus = "5"

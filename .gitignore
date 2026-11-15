@@ -1,0 +1,7 @@
+/target/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.DS_Store

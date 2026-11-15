@@ -1,0 +1,79 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_activity_digest",
+      "description": "Get a compact, pre-aggregated summary of active (non-minimized) computer time by category, top applications, top websites, and opened files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "days": {
+            "type": "integer",
+            "description": "0 for today since midnight, 7 for last 7 days, etc. Default 0."
+          },
+          "since": {
+            "type": "string",
+            "description": "Optional start date in YYYY-MM-DD format."
+          },
+          "top_n": {
+            "type": "integer",
+            "description": "Maximum items per section (apps, sites, files). Keep small (5-15). Default 10."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_focus_blocks",
+      "description": "Get a chronological timeline of merged deep-work/focus blocks (collapses rapid window switches into clean intervals).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "days": {
+            "type": "integer",
+            "description": "0 for today, 7 for last 7 days. Default 0."
+          },
+          "since": {
+            "type": "string",
+            "description": "Optional start date YYYY-MM-DD."
+          },
+          "min_duration_sec": {
+            "type": "integer",
+            "description": "Minimum block duration in seconds to include. Default 30."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of recent blocks to return. Default 25."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_activity",
+      "description": "Search active window sessions, opened files, and visited websites by keyword (e.g. project name, filename, domain).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Keyword to search for."
+          },
+          "days": {
+            "type": "integer",
+            "description": "How many days back to search. Default 7."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max matches per category. Default 15."
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  }
+]
