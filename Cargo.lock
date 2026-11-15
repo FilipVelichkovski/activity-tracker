@@ -3,9 +3,32 @@
 version = 4
 
 [[package]]
+name = "activity-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "activity-remote-server"
+version = "0.1.0"
+dependencies = [
+ "activity-protocol",
+ "axum",
+ "chrono",
+ "clap",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "activity-tracker"
 version = "0.2.0"
 dependencies = [
+ "activity-protocol",
  "axum",
  "chrono",
  "clap",

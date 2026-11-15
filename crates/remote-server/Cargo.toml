@@ -1,0 +1,18 @@
+[package]
+name = "activity-remote-server"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight in-memory LAN HTTP server for today's activity summary (Termux/ARM64 friendly)"
+
+[dependencies]
+activity-protocol = { path = "../activity-protocol" }
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

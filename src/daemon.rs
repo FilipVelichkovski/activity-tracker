@@ -6,12 +6,13 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use zbus::{Connection, Proxy, interface};
 
 use crate::browser::{FirefoxSessionCache, detect_site_visit};
 use crate::dbus_monitor::{DbusFileEvent, run_dbus_monitor};
 use crate::proc_scanner::scan_open_files;
+use crate::remote_sync::{RemoteConfig, spawn_remote_sync};
 use crate::storage::TrackerDb;
 use crate::title_files::extract_file_from_title;
 use crate::tray::spawn_tray;
@@ -48,6 +49,7 @@ pub struct TrackerState {
     pub verbose: bool,
     pub proc_fallback: bool,
     pub ff_cache: FirefoxSessionCache,
+    pub remote_notify: Option<Arc<Notify>>,
 }
 
 impl TrackerState {
@@ -61,6 +63,13 @@ impl TrackerState {
             verbose,
             proc_fallback,
             ff_cache: FirefoxSessionCache::new(),
+            remote_notify: None,
+        }
+    }
+
+    fn notify_remote(&self) {
+        if let Some(ref notify) = self.remote_notify {
+            notify.notify_one();
         }
     }
 
@@ -77,6 +86,7 @@ impl TrackerState {
                 }
             }
         }
+        self.notify_remote();
     }
 
     fn log(&self, msg: &str) {
@@ -172,7 +182,11 @@ impl TrackerState {
         let now = now_secs();
 
         if self.screen_locked || self.manually_paused || !is_visible_active || app_name.is_empty() {
+            let had_session = self.current.is_some();
             self.close_current_session(now);
+            if had_session {
+                self.notify_remote();
+            }
             return;
         }
 
@@ -184,6 +198,7 @@ impl TrackerState {
 
         self.close_current_session(now);
         self.start_session(app_name, window_title, pid, now);
+        self.notify_remote();
     }
 
     pub fn handle_screensaver_changed(&mut self, active: bool) {
@@ -199,13 +214,16 @@ impl TrackerState {
                 }
             }
         }
+        self.notify_remote();
     }
 
     pub fn heartbeat(&mut self) {
         if self.screen_locked || self.manually_paused {
+            self.notify_remote();
             return;
         }
         let Some(cur) = self.current.clone() else {
+            self.notify_remote();
             return;
         };
         let now = now_secs();
@@ -232,6 +250,7 @@ impl TrackerState {
                 );
             }
         }
+        self.notify_remote();
     }
 
     pub fn record_external_file(
@@ -350,11 +369,19 @@ pub async fn run_daemon(
     proc_fallback: bool,
     web_addr: Option<String>,
     enable_tray: bool,
+    remote_cfg: Option<RemoteConfig>,
 ) -> Result<(), String> {
     let db = TrackerDb::open(db_path).map_err(|e| format!("Failed to open DB: {e}"))?;
     let db_file_path = db.path().to_path_buf();
     let db_display = db_file_path.display().to_string();
     let state = Arc::new(Mutex::new(TrackerState::new(db, verbose, proc_fallback)));
+
+    if let Some(cfg) = remote_cfg {
+        let notify = spawn_remote_sync(Arc::clone(&state), cfg, verbose)?;
+        if let Ok(mut guard) = state.lock() {
+            guard.remote_notify = Some(notify);
+        }
+    }
 
     let conn = Connection::session()
         .await

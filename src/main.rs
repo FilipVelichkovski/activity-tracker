@@ -3,6 +3,7 @@ mod categorizer;
 mod daemon;
 mod dbus_monitor;
 mod proc_scanner;
+mod remote_sync;
 mod storage;
 mod title_files;
 mod tray;
@@ -54,6 +55,12 @@ enum Commands {
         /// Disable system tray icon
         #[arg(long)]
         no_tray: bool,
+        /// Remote server URL to push today's summary over LAN (env: ACTIVITY_TRACKER_REMOTE_URL)
+        #[arg(long)]
+        remote_url: Option<String>,
+        /// Optional bearer token for the remote server (env: ACTIVITY_TRACKER_REMOTE_TOKEN)
+        #[arg(long)]
+        remote_token: Option<String>,
     },
     /// Serve the Web UI standalone (read-only historical view)
     Web {
@@ -497,14 +504,31 @@ async fn main() -> Result<(), String> {
             web_addr,
             no_web,
             no_tray,
+            remote_url,
+            remote_token,
         } => {
             let web = if no_web { None } else { Some(web_addr) };
+            let resolved_url = remote_url.or_else(|| {
+                std::env::var("ACTIVITY_TRACKER_REMOTE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
+            let resolved_token = remote_token.or_else(|| {
+                std::env::var("ACTIVITY_TRACKER_REMOTE_TOKEN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
+            let remote_cfg = resolved_url.map(|url| remote_sync::RemoteConfig {
+                url,
+                token: resolved_token,
+            });
             daemon::run_daemon(
                 cli.db.as_deref(),
                 verbose,
                 !no_proc_fallback,
                 web,
                 !no_tray,
+                remote_cfg,
             )
             .await?;
         }

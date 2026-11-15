@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/activity-protocol", "crates/remote-server"]
+
 [package]
 name = "activity-tracker"
 version = "0.2.0"
@@ -5,6 +8,7 @@ edition = "2024"
 description = "KDE Wayland active (non-minimized) window & opened file tracker using KWin, DBus, XBEL, and /proc fallback"
 
 [dependencies]
+activity-protocol = { path = "crates/activity-protocol" }
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }

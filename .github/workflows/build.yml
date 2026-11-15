@@ -1,0 +1,56 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binaries (x86_64)
+        run: cargo build --release --workspace --locked
+
+  build-arm64-musl:
+    name: Build Remote Server (ARM64 static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with aarch64-unknown-linux-musl
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build activity-remote-server (aarch64-unknown-linux-musl)
+        run: cargo build --release -p activity-remote-server --target aarch64-unknown-linux-musl --locked
+
+      - name: Verify static linking
+        run: file target/aarch64-unknown-linux-musl/release/activity-remote-server
+
+      - name: Upload ARM64 binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: activity-remote-server-aarch64-musl
+          path: target/aarch64-unknown-linux-musl/release/activity-remote-server
