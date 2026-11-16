@@ -40,3 +40,7 @@ Start `activity-tracker` with `--remote-url` pointing to your phone's LAN IP:
 ```bash
 activity-tracker run --remote-url http://192.168.1.50:7879 --remote-token my-lan-secret -v
 ```
+
+## HTTP API Specification
+
+See [docs/API_SPEC.md](../../docs/API_SPEC.md) for the full endpoint and payload specification (daemon push, mobile app summary/status, and home screen widget endpoints).
