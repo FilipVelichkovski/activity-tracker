@@ -66,6 +66,115 @@ pub fn default_db_path() -> PathBuf {
     home.join(".local/share/activity-tracker/activity.db")
 }
 
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+
+const KEYRING_SERVICE: &str = "activity-tracker";
+const KEYRING_USER: &str = "sqlite-db-key";
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+fn generate_hex_key() -> std::io::Result<String> {
+    let mut buf = [0u8; 32];
+    let mut f = std::fs::File::open("/dev/urandom")?;
+    f.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn read_or_create_keyfile(db_path: &Path) -> Result<String, String> {
+    let key_path = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".db_key");
+    if let Ok(existing) = std::fs::read_to_string(&key_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let key = generate_hex_key().map_err(|e| format!("Failed to generate DB key: {e}"))?;
+    if let Some(parent) = key_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&key_path, &key).map_err(|e| format!("Failed to write keyfile: {e}"))?;
+    let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    Ok(key)
+}
+
+fn resolve_db_key(db_path: &Path) -> Result<String, String> {
+    if let Ok(env_key) = std::env::var("ACTIVITY_TRACKER_DB_KEY") {
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        Ok(entry) => match entry.get_password() {
+            Ok(pw) if !pw.trim().is_empty() => Ok(pw),
+            Ok(_) | Err(keyring::Error::NoEntry) => {
+                let key =
+                    generate_hex_key().map_err(|e| format!("Failed to generate DB key: {e}"))?;
+                match entry.set_password(&key) {
+                    Ok(()) => Ok(key),
+                    Err(e) => {
+                        eprintln!(
+                            "[storage] Secret Service unavailable ({e}); falling back to 0600 keyfile"
+                        );
+                        read_or_create_keyfile(db_path)
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[storage] Secret Service lookup failed ({e}); falling back to 0600 keyfile"
+                );
+                read_or_create_keyfile(db_path)
+            }
+        },
+        Err(e) => {
+            eprintln!("[storage] Keyring init failed ({e}); falling back to 0600 keyfile");
+            read_or_create_keyfile(db_path)
+        }
+    }
+}
+
+fn is_plaintext_sqlite(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    matches!(f.read_exact(&mut header), Ok(()) if &header == SQLITE_HEADER)
+}
+
+fn migrate_plaintext_to_sqlcipher(path: &Path, key: &str) -> rusqlite::Result<()> {
+    let tmp_path = path.with_extension("db.enc.tmp");
+    let _ = std::fs::remove_file(&tmp_path);
+
+    {
+        let plain = Connection::open(path)?;
+        let _ = plain.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let tmp_str = tmp_path.to_string_lossy().replace('\'', "''");
+        let key_esc = key.replace('\'', "''");
+        plain.execute_batch(&format!(
+            "ATTACH DATABASE '{tmp_str}' AS encrypted KEY '{key_esc}';
+             SELECT sqlcipher_export('encrypted');
+             DETACH DATABASE encrypted;"
+        ))?;
+    }
+
+    // Remove stale WAL/SHM from the plaintext DB before replacing it
+    let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+    let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    eprintln!(
+        "[storage] Migrated plaintext database {} to SQLCipher encryption",
+        path.display()
+    );
+    Ok(())
+}
+
 pub struct TrackerDb {
     conn: Connection,
     path: PathBuf,
@@ -76,10 +185,24 @@ impl TrackerDb {
         let path = override_path
             .map(Path::to_path_buf)
             .unwrap_or_else(default_db_path);
+        let key = resolve_db_key(&path).map_err(|e| {
+            rusqlite::Error::InvalidParameterName(format!("DB key resolution failed: {e}"))
+        })?;
+        Self::open_with_key(Some(&path), &key)
+    }
+
+    pub fn open_with_key(override_path: Option<&Path>, key: &str) -> rusqlite::Result<Self> {
+        let path = override_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_db_path);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        if path.exists() && is_plaintext_sqlite(&path) {
+            migrate_plaintext_to_sqlcipher(&path, key)?;
+        }
         let conn = Connection::open(&path)?;
+        conn.pragma_update(None, "key", key)?;
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
@@ -390,6 +513,33 @@ impl TrackerDb {
 
         rows.collect()
     }
+
+    pub fn query_sessions_in_range(
+        &self,
+        since_ts: f64,
+        until_ts: f64,
+    ) -> rusqlite::Result<Vec<SessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, app_name, window_title, pid, started_at, ended_at, duration_sec
+             FROM sessions
+             WHERE started_at >= ?1 AND started_at <= ?2
+             ORDER BY started_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![since_ts, until_ts], |row| {
+            Ok(SessionRecord {
+                id: row.get(0)?,
+                app_name: row.get(1)?,
+                window_title: row.get(2)?,
+                pid: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                duration_sec: row.get(6)?,
+            })
+        })?;
+
+        rows.collect()
+    }
 }
 
 #[cfg(test)]
@@ -403,7 +553,7 @@ mod tests {
         let db_path = dir.join("fanout.db");
         let _ = std::fs::remove_file(&db_path);
 
-        let db = TrackerDb::open(Some(&db_path)).unwrap();
+        let db = TrackerDb::open_with_key(Some(&db_path), "0123456789abcdef0123456789abcdef").unwrap();
         let sid = db.start_session("org.kde.kate", "a.txt", 1234, 100.0).unwrap();
         db.update_session_end(sid, 110.0).unwrap();
         db.record_file(Some(sid), "org.kde.kate", "/tmp/a.txt", "xbel", 105.0).unwrap();
@@ -414,6 +564,51 @@ mod tests {
         assert!((summary[0].total_sec - 10.0).abs() < 1e-6);
         assert_eq!(summary[0].session_count, 1);
         assert_eq!(summary[0].file_count, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sqlcipher_encrypts_and_migrates_plaintext_db() {
+        let dir = std::env::temp_dir().join(format!("agy_cipher_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("migrate.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        // 1. Create a legacy plaintext SQLite database
+        {
+            let plain = Connection::open(&db_path).unwrap();
+            plain
+                .execute_batch(
+                    "CREATE TABLE sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        app_name TEXT NOT NULL,
+                        window_title TEXT NOT NULL,
+                        pid INTEGER NOT NULL,
+                        started_at REAL NOT NULL,
+                        ended_at REAL NOT NULL,
+                        duration_sec REAL NOT NULL
+                    );
+                    INSERT INTO sessions (app_name, window_title, pid, started_at, ended_at, duration_sec)
+                    VALUES ('dev.zed.Zed', 'lib.rs', 42, 100.0, 130.0, 30.0);",
+                )
+                .unwrap();
+        }
+        assert!(is_plaintext_sqlite(&db_path));
+
+        // 2. Opening with TrackerDb::open_with_key migrates it to SQLCipher & preserves rows
+        let key = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        {
+            let db = TrackerDb::open_with_key(Some(&db_path), key).unwrap();
+            let sessions = db.query_sessions_in_range(0.0, 200.0).unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].app_name, "dev.zed.Zed");
+            assert_eq!(sessions[0].window_title, "lib.rs");
+        }
+
+        // 3. File is no longer plaintext SQLite and rejects wrong/missing keys
+        assert!(!is_plaintext_sqlite(&db_path));
+        assert!(TrackerDb::open_with_key(Some(&db_path), "wrong-key").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

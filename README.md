@@ -62,3 +62,21 @@ See [crates/remote-server/README.md](crates/remote-server/README.md) for Termux 
 
 CI builds a statically linked `aarch64-unknown-linux-musl` binary automatically on push via [.github/workflows/build.yml](.github/workflows/build.yml).
 
+## Privacy, Redaction & Reporter Plugins
+
+Activity Tracker includes a runtime-hot-reloaded privacy pipeline (`~/.config/activity-tracker/privacy.json`, or `--privacy-config <PATH>` / `ACTIVITY_TRACKER_PRIVACY_CONFIG`):
+
+```bash
+./target/release/activity-tracker privacy init                  # Write default privacy.json
+./target/release/activity-tracker privacy show                  # Show active config & path
+./target/release/activity-tracker privacy domains               # List built-in sensitive domains
+./target/release/activity-tracker privacy fetch-lists           # Download MISP global bank-website list
+./target/release/activity-tracker privacy fetch-lists --include-adult --include-gambling
+```
+
+- **Per-sink controls (`storage`, `ui`, `remote`, `llm`)**: Independently toggle `enabled`, `include_app`, `include_title`, `include_files`, `include_sites`, and `include_category` (e.g., save only app + category to SQLite, show full details in local UI, send only category to the remote server, and hide or redact for `llm-tool/activity_tool.py`).
+- **Premade & default sensitive domain lists**: Supports loading external premade lists (`sensitive_domain_files` or auto-loading `~/.config/activity-tracker/lists/*`) in **MISP warninglist JSON** (`MISP/misp-warninglists` `bank-website/list.json`), **hosts-file** (`StevenBlack/hosts`), **Adblock** (`||domain^`), or plain text formats—combined with a built-in default list, `sensitive_domains` additions, and `allow_domains` overrides (`sensitive_domain_action`: `"ignore"` or `"redact"`).
+- **Per-app/title/domain/category rules**: Override any sink or all sinks per rule.
+- **Reporter plugins (`plugins.discord_rpc`)**: Disabled by default. When enabled, operates as a strict whitelist (`hide_by_default: true`, `show_title: false`) over Discord's local IPC socket (`discord-ipc-0`), hiding/clearing presence for any app or category not in `allowed_apps` / `allowed_categories`.
+
+

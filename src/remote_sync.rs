@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 
 use crate::categorizer::classify_activity;
 use crate::daemon::TrackerState;
+use crate::privacy::Sink;
 
 const HTTP_TIMEOUT_SECS: u64 = 3;
 
@@ -95,6 +96,30 @@ fn local_hostname() -> String {
 pub fn build_today_payload(state: &TrackerState, now: f64) -> Result<DailySummaryPayload, String> {
     let local_now = Local::now();
     let date = local_now.format("%Y-%m-%d").to_string();
+    let policy = state.privacy.sink_policy(Sink::Remote).clone();
+
+    if !policy.enabled {
+        return Ok(DailySummaryPayload {
+            date,
+            source_host: local_hostname(),
+            updated_at: now,
+            total_active_sec: 0.0,
+            status: LiveStatus {
+                tracking: false,
+                paused: state.manually_paused,
+                screen_locked: state.screen_locked,
+                current_app: None,
+                current_title: None,
+                current_category: None,
+                current_duration_sec: 0.0,
+            },
+            categories: Vec::new(),
+            apps: Vec::new(),
+            top_sites: Vec::new(),
+            recent_files: Vec::new(),
+        });
+    }
+
     let today_midnight = local_now.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let since_ts = Local
         .from_local_datetime(&today_midnight)
@@ -111,77 +136,142 @@ pub fn build_today_payload(state: &TrackerState, now: f64) -> Result<DailySummar
         .db
         .query_app_summary(since_ts, until_ts, None)
         .map_err(|e| e.to_string())?;
-    let raw_sites = state
-        .db
-        .query_visited_sites(since_ts, until_ts, None, 20)
-        .map_err(|e| e.to_string())?;
-    let raw_files = state
-        .db
-        .query_opened_files(since_ts, until_ts, None, 20)
-        .map_err(|e| e.to_string())?;
+    let raw_sites = if policy.include_sites {
+        state
+            .db
+            .query_visited_sites(since_ts, until_ts, None, 20)
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+    let raw_files = if policy.include_files {
+        state
+            .db
+            .query_opened_files(since_ts, until_ts, None, 20)
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
 
-    let total_active_sec: f64 = raw_apps.iter().map(|a| a.total_sec).sum();
-
-    let categories = raw_cats
+    let apps: Vec<AppItem> = raw_apps
         .into_iter()
-        .map(|c| {
-            let share_pct = if total_active_sec > 0.0 {
-                (c.total_sec / total_active_sec) * 100.0
-            } else {
-                0.0
-            };
-            CategoryItem {
-                category: c.category,
-                total_sec: c.total_sec,
-                share_pct,
-                session_count: c.session_count,
-                app_count: c.app_count,
+        .filter_map(|a| {
+            let d = state
+                .privacy
+                .evaluate_activity(Sink::Remote, &a.app_name, "", "");
+            if !d.allow {
+                return None;
             }
-        })
-        .collect();
-
-    let apps = raw_apps
-        .into_iter()
-        .map(|a| {
-            let category = classify_activity(&a.app_name, "").to_string();
-            AppItem {
-                app_name: a.app_name,
-                category,
+            let cat = if policy.include_category {
+                classify_activity(&a.app_name, "").to_string()
+            } else {
+                policy.redact_text.clone()
+            };
+            Some(AppItem {
+                app_name: d.app_name,
+                category: cat,
                 total_sec: a.total_sec,
                 session_count: a.session_count,
-                file_count: a.file_count,
-            }
+                file_count: if d.allow_files { a.file_count } else { 0 },
+            })
         })
         .collect();
+
+    let total_active_sec: f64 = apps.iter().map(|a| a.total_sec).sum();
+
+    let categories: Vec<CategoryItem> = if policy.include_category {
+        raw_cats
+            .into_iter()
+            .filter_map(|c| {
+                let d = state
+                    .privacy
+                    .evaluate_activity(Sink::Remote, "", "", "");
+                if !d.allow {
+                    return None;
+                }
+                let share_pct = if total_active_sec > 0.0 {
+                    (c.total_sec / total_active_sec) * 100.0
+                } else {
+                    0.0
+                };
+                Some(CategoryItem {
+                    category: c.category,
+                    total_sec: c.total_sec,
+                    share_pct,
+                    session_count: c.session_count,
+                    app_count: c.app_count,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let top_sites = raw_sites
         .into_iter()
-        .map(|s| SiteItem {
-            domain: s.domain,
-            page_title: s.page_title,
-            app_name: s.app_name,
-            last_seen_at: s.last_seen_at,
+        .filter_map(|s| {
+            if !state
+                .privacy
+                .allow_site(Sink::Remote, &s.app_name, &s.domain, &s.page_title)
+            {
+                return None;
+            }
+            let d = state
+                .privacy
+                .evaluate_activity(Sink::Remote, &s.app_name, &s.page_title, &s.domain);
+            if !d.allow || !d.allow_sites {
+                return None;
+            }
+            Some(SiteItem {
+                domain: s.domain,
+                page_title: d.window_title,
+                app_name: d.app_name,
+                last_seen_at: s.last_seen_at,
+            })
         })
         .collect();
 
     let recent_files = raw_files
         .into_iter()
-        .map(|f| FileItem {
-            app_name: f.app_name,
-            file_path: f.file_path,
-            source: f.source,
-            last_seen_at: f.last_seen_at,
+        .filter_map(|f| {
+            if !state
+                .privacy
+                .allow_file(Sink::Remote, &f.app_name, &f.file_path)
+            {
+                return None;
+            }
+            let d = state
+                .privacy
+                .evaluate_activity(Sink::Remote, &f.app_name, &f.file_path, "");
+            if !d.allow || !d.allow_files {
+                return None;
+            }
+            Some(FileItem {
+                app_name: d.app_name,
+                file_path: f.file_path,
+                source: f.source,
+                last_seen_at: f.last_seen_at,
+            })
         })
         .collect();
 
     let (current_app, current_title, current_category, current_duration_sec) = match &state.current
     {
-        Some(cur) => (
-            Some(cur.app_name.clone()),
-            Some(cur.window_title.clone()),
-            Some(classify_activity(&cur.app_name, &cur.window_title).to_string()),
-            (now - cur.started_at).max(0.0),
-        ),
+        Some(cur) => {
+            let d = state
+                .privacy
+                .evaluate_activity(Sink::Remote, &cur.app_name, &cur.window_title, "");
+            if d.allow {
+                (
+                    Some(d.app_name),
+                    Some(d.window_title),
+                    Some(d.category),
+                    (now - cur.started_at).max(0.0),
+                )
+            } else {
+                (None, None, None, 0.0)
+            }
+        }
         None => (None, None, None, 0.0),
     };
 

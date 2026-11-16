@@ -10,7 +10,10 @@ use tokio::sync::{Notify, mpsc};
 use zbus::{Connection, Proxy, interface};
 
 use crate::browser::{FirefoxSessionCache, detect_site_visit};
+use crate::categorizer::classify_activity;
 use crate::dbus_monitor::{DbusFileEvent, run_dbus_monitor};
+use crate::plugins::{PluginActivity, PluginManager};
+use crate::privacy::{PrivacyEngine, Sink};
 use crate::proc_scanner::scan_open_files;
 use crate::remote_sync::{RemoteConfig, spawn_remote_sync};
 use crate::storage::TrackerDb;
@@ -36,6 +39,9 @@ pub struct ActiveSession {
     pub session_id: i64,
     pub app_name: String,
     pub window_title: String,
+    pub stored_app_name: String,
+    pub allow_storage_files: bool,
+    pub allow_storage_sites: bool,
     pub pid: i64,
     pub started_at: f64,
 }
@@ -51,10 +57,26 @@ pub struct TrackerState {
     pub ff_cache: FirefoxSessionCache,
     pub remote_notify: Option<Arc<Notify>>,
     pub last_heartbeat_at: f64,
+    pub privacy: PrivacyEngine,
+    pub plugins: PluginManager,
 }
 
 impl TrackerState {
     pub fn new(db: TrackerDb, verbose: bool, proc_fallback: bool) -> Self {
+        Self::new_with_privacy(
+            db,
+            verbose,
+            proc_fallback,
+            PrivacyEngine::load(None),
+        )
+    }
+
+    pub fn new_with_privacy(
+        db: TrackerDb,
+        verbose: bool,
+        proc_fallback: bool,
+        privacy: PrivacyEngine,
+    ) -> Self {
         Self {
             db,
             current: None,
@@ -66,6 +88,8 @@ impl TrackerState {
             ff_cache: FirefoxSessionCache::new(),
             remote_notify: None,
             last_heartbeat_at: now_secs(),
+            privacy,
+            plugins: PluginManager::new(),
         }
     }
 
@@ -73,6 +97,19 @@ impl TrackerState {
         if let Some(ref notify) = self.remote_notify {
             notify.notify_one();
         }
+    }
+
+    fn sync_plugins(&mut self) {
+        let act = self.current.as_ref().map(|cur| PluginActivity {
+            app_name: cur.app_name.clone(),
+            window_title: cur.window_title.clone(),
+            category: classify_activity(&cur.app_name, &cur.window_title).to_string(),
+            started_at: cur.started_at,
+            paused: self.manually_paused,
+            screen_locked: self.screen_locked,
+        });
+        let plugins_cfg = self.privacy.config().plugins.clone();
+        self.plugins.notify_update(act.as_ref(), &plugins_cfg);
     }
 
     pub fn toggle_manual_pause(&mut self) {
@@ -88,6 +125,7 @@ impl TrackerState {
                 }
             }
         }
+        self.sync_plugins();
         self.notify_remote();
     }
 
@@ -103,15 +141,17 @@ impl TrackerState {
             return;
         };
         let _ = self.db.update_session_end(sess.session_id, now);
-        if self.proc_fallback && sess.pid > 0 {
+        if self.proc_fallback && sess.allow_storage_files && sess.pid > 0 {
             for path in scan_open_files(sess.pid) {
-                let _ = self.db.record_file(
-                    Some(sess.session_id),
-                    &sess.app_name,
-                    &path,
-                    "proc-fd",
-                    now,
-                );
+                if self.privacy.allow_file(Sink::Storage, &sess.app_name, &path) {
+                    let _ = self.db.record_file(
+                        Some(sess.session_id),
+                        &sess.stored_app_name,
+                        &path,
+                        "proc-fd",
+                        now,
+                    );
+                }
             }
         }
         self.log(&format!(
@@ -123,46 +163,86 @@ impl TrackerState {
     }
 
     fn start_session(&mut self, app_name: &str, window_title: &str, pid: i64, now: f64) {
-        let Ok(session_id) = self.db.start_session(app_name, window_title, pid, now) else {
+        let decision = self
+            .privacy
+            .evaluate_activity(Sink::Storage, app_name, window_title, "");
+        if !decision.allow {
+            self.log(&format!(
+                "SKIP  [privacy] app={app_name:?} title={window_title:?}"
+            ));
+            self.sync_plugins();
+            return;
+        }
+
+        let Ok(session_id) =
+            self.db
+                .start_session(&decision.app_name, &decision.window_title, pid, now)
+        else {
             return;
         };
         self.current = Some(ActiveSession {
             session_id,
             app_name: app_name.to_string(),
             window_title: window_title.to_string(),
+            stored_app_name: decision.app_name.clone(),
+            allow_storage_files: decision.allow_files,
+            allow_storage_sites: decision.allow_sites,
             pid,
             started_at: now,
         });
-        if let Some((file_path, source)) = extract_file_from_title(app_name, window_title) {
-            let _ = self
-                .db
-                .record_file(Some(session_id), app_name, &file_path, source, now);
-        }
-        if let Some(visit) = detect_site_visit(app_name, window_title, &mut self.ff_cache) {
-            let _ = self.db.record_site(
-                Some(session_id),
-                &visit.app_name,
-                &visit.domain,
-                &visit.url,
-                &visit.page_title,
-                visit.source,
-                now,
-            );
-        }
-        let mut proc_count = 0;
-        if self.proc_fallback && pid > 0 {
-            let files = scan_open_files(pid);
-            proc_count = files.len();
-            for path in files {
-                let _ = self.db.record_file(
-                    Some(session_id),
-                    app_name,
-                    &path,
-                    "proc-fd",
-                    now,
-                );
+        if decision.allow_files {
+            if let Some((file_path, source)) = extract_file_from_title(app_name, window_title) {
+                if self
+                    .privacy
+                    .allow_file(Sink::Storage, app_name, &file_path)
+                {
+                    let _ = self.db.record_file(
+                        Some(session_id),
+                        &decision.app_name,
+                        &file_path,
+                        source,
+                        now,
+                    );
+                }
             }
         }
+        if decision.allow_sites {
+            if let Some(visit) = detect_site_visit(app_name, window_title, &mut self.ff_cache) {
+                if self.privacy.allow_site(
+                    Sink::Storage,
+                    &visit.app_name,
+                    &visit.domain,
+                    &visit.page_title,
+                ) {
+                    let _ = self.db.record_site(
+                        Some(session_id),
+                        &visit.app_name,
+                        &visit.domain,
+                        &visit.url,
+                        &visit.page_title,
+                        visit.source,
+                        now,
+                    );
+                }
+            }
+        }
+        let mut proc_count = 0;
+        if self.proc_fallback && decision.allow_files && pid > 0 {
+            let files = scan_open_files(pid);
+            for path in files {
+                if self.privacy.allow_file(Sink::Storage, app_name, &path) {
+                    proc_count += 1;
+                    let _ = self.db.record_file(
+                        Some(session_id),
+                        &decision.app_name,
+                        &path,
+                        "proc-fd",
+                        now,
+                    );
+                }
+            }
+        }
+        self.sync_plugins();
         self.log(&format!(
             "START app={app_name:?} pid={pid} proc_files={proc_count} title={window_title:?}"
         ));
@@ -187,6 +267,7 @@ impl TrackerState {
             let had_session = self.current.is_some();
             self.close_current_session(now);
             if had_session {
+                self.sync_plugins();
                 self.notify_remote();
             }
             return;
@@ -216,10 +297,14 @@ impl TrackerState {
                 }
             }
         }
+        self.sync_plugins();
         self.notify_remote();
     }
 
     pub fn heartbeat(&mut self) {
+        if self.privacy.reload_if_changed() {
+            self.log("Reloaded privacy config");
+        }
         let now = now_secs();
         let prev = self.last_heartbeat_at;
         self.last_heartbeat_at = now;
@@ -228,41 +313,56 @@ impl TrackerState {
         if (now - prev) > 20.0 {
             self.log(&format!("Detected {:.1}s gap (suspend/sleep); closing stale session", now - prev));
             self.close_current_session(prev);
+            self.sync_plugins();
             self.notify_remote();
             return;
         }
 
         if self.screen_locked || self.manually_paused {
+            self.sync_plugins();
             self.notify_remote();
             return;
         }
         let Some(cur) = self.current.clone() else {
+            self.sync_plugins();
             self.notify_remote();
             return;
         };
         let _ = self.db.update_session_end(cur.session_id, now);
-        if let Some(visit) = detect_site_visit(&cur.app_name, &cur.window_title, &mut self.ff_cache) {
-            let _ = self.db.record_site(
-                Some(cur.session_id),
-                &visit.app_name,
-                &visit.domain,
-                &visit.url,
-                &visit.page_title,
-                visit.source,
-                now,
-            );
-        }
-        if self.proc_fallback && cur.pid > 0 {
-            for path in scan_open_files(cur.pid) {
-                let _ = self.db.record_file(
-                    Some(cur.session_id),
-                    &cur.app_name,
-                    &path,
-                    "proc-fd",
-                    now,
-                );
+        if cur.allow_storage_sites {
+            if let Some(visit) = detect_site_visit(&cur.app_name, &cur.window_title, &mut self.ff_cache) {
+                if self.privacy.allow_site(
+                    Sink::Storage,
+                    &visit.app_name,
+                    &visit.domain,
+                    &visit.page_title,
+                ) {
+                    let _ = self.db.record_site(
+                        Some(cur.session_id),
+                        &visit.app_name,
+                        &visit.domain,
+                        &visit.url,
+                        &visit.page_title,
+                        visit.source,
+                        now,
+                    );
+                }
             }
         }
+        if self.proc_fallback && cur.allow_storage_files && cur.pid > 0 {
+            for path in scan_open_files(cur.pid) {
+                if self.privacy.allow_file(Sink::Storage, &cur.app_name, &path) {
+                    let _ = self.db.record_file(
+                        Some(cur.session_id),
+                        &cur.stored_app_name,
+                        &path,
+                        "proc-fd",
+                        now,
+                    );
+                }
+            }
+        }
+        self.sync_plugins();
         self.notify_remote();
     }
 
@@ -273,16 +373,27 @@ impl TrackerState {
         source: &str,
         ts: f64,
     ) {
-        let session_id = self.current.as_ref().map(|c| c.session_id);
-        let app_name = app_hint
+        let raw_app = app_hint
             .filter(|s| !s.is_empty())
             .or_else(|| self.current.as_ref().map(|c| c.app_name.as_str()))
             .unwrap_or("unknown");
 
+        if !self.privacy.allow_file(Sink::Storage, raw_app, file_path) {
+            return;
+        }
+
+        let decision = self
+            .privacy
+            .evaluate_activity(Sink::Storage, raw_app, file_path, "");
+        if !decision.allow || !decision.allow_files {
+            return;
+        }
+
+        let session_id = self.current.as_ref().map(|c| c.session_id);
         let _ = self
             .db
-            .record_file(session_id, app_name, file_path, source, ts);
-        self.log(&format!("FILE  [{source}] app={app_name:?} path={file_path:?}"));
+            .record_file(session_id, &decision.app_name, file_path, source, ts);
+        self.log(&format!("FILE  [{source}] app={raw_app:?} path={file_path:?}"));
     }
 }
 
@@ -378,6 +489,7 @@ async fn load_kwin_script(js_path: &Path) -> Result<String, String> {
 
 pub async fn run_daemon(
     db_path: Option<&Path>,
+    privacy_path: Option<&Path>,
     verbose: bool,
     proc_fallback: bool,
     web_addr: Option<String>,
@@ -387,7 +499,14 @@ pub async fn run_daemon(
     let db = TrackerDb::open(db_path).map_err(|e| format!("Failed to open DB: {e}"))?;
     let db_file_path = db.path().to_path_buf();
     let db_display = db_file_path.display().to_string();
-    let state = Arc::new(Mutex::new(TrackerState::new(db, verbose, proc_fallback)));
+    let privacy = PrivacyEngine::load(privacy_path);
+    let privacy_file_path = privacy.path().to_path_buf();
+    let state = Arc::new(Mutex::new(TrackerState::new_with_privacy(
+        db,
+        verbose,
+        proc_fallback,
+        privacy,
+    )));
 
     if let Some(cfg) = remote_cfg {
         let notify = spawn_remote_sync(Arc::clone(&state), cfg, verbose)?;
@@ -490,6 +609,7 @@ pub async fn run_daemon(
     let web_url = if let Some(ref addr) = web_addr {
         let ctx = WebContext {
             db_path: db_file_path,
+            privacy_path: Some(privacy_file_path),
             state: Some(Arc::clone(&state)),
         };
         let addr_clone = addr.clone();
@@ -584,6 +704,7 @@ pub async fn run_daemon(
 
     if let Ok(mut guard) = state.lock() {
         guard.close_current_session(now_secs());
+        guard.plugins.shutdown();
     }
     unload_kwin_script().await;
     if verbose {

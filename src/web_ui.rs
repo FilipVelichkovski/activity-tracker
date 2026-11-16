@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::daemon::TrackerState;
+use crate::privacy::{PrivacyEngine, Sink};
 use crate::storage::{
     AppSummary, CategorySummary, OpenedFileRecord, SessionRecord, TrackerDb, VisitedSiteRecord,
 };
@@ -19,6 +20,7 @@ use crate::storage::{
 #[derive(Clone)]
 pub struct WebContext {
     pub db_path: PathBuf,
+    pub privacy_path: Option<PathBuf>,
     pub state: Option<Arc<Mutex<TrackerState>>>,
 }
 
@@ -78,11 +80,23 @@ async fn api_status(State(ctx): State<WebContext>) -> Json<StatusResponse> {
                 .unwrap_or_default()
                 .as_secs_f64();
             let (current_app, current_title, current_duration_sec) = match &guard.current {
-                Some(cur) => (
-                    Some(cur.app_name.clone()),
-                    Some(cur.window_title.clone()),
-                    (now - cur.started_at).max(0.0),
-                ),
+                Some(cur) => {
+                    let d = guard.privacy.evaluate_activity(
+                        Sink::Ui,
+                        &cur.app_name,
+                        &cur.window_title,
+                        "",
+                    );
+                    if d.allow {
+                        (
+                            Some(d.app_name),
+                            Some(d.window_title),
+                            (now - cur.started_at).max(0.0),
+                        )
+                    } else {
+                        (None, None, 0.0)
+                    }
+                }
                 None => (None, None, 0.0),
             };
             return Json(StatusResponse {
@@ -109,23 +123,83 @@ async fn api_report(
     State(ctx): State<WebContext>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<ReportResponse>, StatusCode> {
+    let privacy = PrivacyEngine::load(ctx.privacy_path.as_deref());
+    let policy = privacy.sink_policy(Sink::Ui).clone();
+    if !policy.enabled {
+        return Ok(Json(ReportResponse {
+            categories: Vec::new(),
+            apps: Vec::new(),
+            files: Vec::new(),
+            sites: Vec::new(),
+        }));
+    }
+
     let (since_ts, until_ts) = time_range_for_days(q.days);
     let app_filter = q.app.as_deref().filter(|s| !s.trim().is_empty());
     let file_limit = q.file_limit.unwrap_or(100).clamp(1, 500);
 
     let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let categories = db
-        .query_category_summary(since_ts, until_ts, app_filter)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let categories = if policy.include_category {
+        db.query_category_summary(since_ts, until_ts, app_filter)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        Vec::new()
+    };
     let apps = db
         .query_app_summary(since_ts, until_ts, app_filter)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let files = db
-        .query_opened_files(since_ts, until_ts, app_filter, file_limit)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let sites = db
-        .query_visited_sites(since_ts, until_ts, app_filter, file_limit)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .filter_map(|mut a| {
+            let d = privacy.evaluate_activity(Sink::Ui, &a.app_name, "", "");
+            if !d.allow {
+                return None;
+            }
+            a.app_name = d.app_name;
+            if !d.allow_files {
+                a.file_count = 0;
+            }
+            Some(a)
+        })
+        .collect();
+    let files = if policy.include_files {
+        db.query_opened_files(since_ts, until_ts, app_filter, file_limit)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .filter_map(|mut f| {
+                if !privacy.allow_file(Sink::Ui, &f.app_name, &f.file_path) {
+                    return None;
+                }
+                let d = privacy.evaluate_activity(Sink::Ui, &f.app_name, &f.file_path, "");
+                if !d.allow || !d.allow_files {
+                    return None;
+                }
+                f.app_name = d.app_name;
+                Some(f)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let sites = if policy.include_sites {
+        db.query_visited_sites(since_ts, until_ts, app_filter, file_limit)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .filter_map(|mut s| {
+                if !privacy.allow_site(Sink::Ui, &s.app_name, &s.domain, &s.page_title) {
+                    return None;
+                }
+                let d = privacy.evaluate_activity(Sink::Ui, &s.app_name, &s.page_title, &s.domain);
+                if !d.allow || !d.allow_sites {
+                    return None;
+                }
+                s.app_name = d.app_name;
+                s.page_title = d.window_title;
+                Some(s)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(ReportResponse {
         categories,
@@ -139,11 +213,26 @@ async fn api_sessions(
     State(ctx): State<WebContext>,
     Query(q): Query<SessionsQuery>,
 ) -> Result<Json<Vec<SessionRecord>>, StatusCode> {
+    let privacy = PrivacyEngine::load(ctx.privacy_path.as_deref());
+    if !privacy.sink_policy(Sink::Ui).enabled {
+        return Ok(Json(Vec::new()));
+    }
     let limit = q.limit.unwrap_or(30).clamp(1, 200);
     let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let sessions = db
         .query_recent_sessions(limit)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .filter_map(|mut s| {
+            let d = privacy.evaluate_activity(Sink::Ui, &s.app_name, &s.window_title, "");
+            if !d.allow {
+                return None;
+            }
+            s.app_name = d.app_name;
+            s.window_title = d.window_title;
+            Some(s)
+        })
+        .collect();
     Ok(Json(sessions))
 }
 

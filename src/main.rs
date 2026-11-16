@@ -2,6 +2,9 @@ mod browser;
 mod categorizer;
 mod daemon;
 mod dbus_monitor;
+mod llm;
+mod plugins;
+mod privacy;
 mod proc_scanner;
 mod remote_sync;
 mod storage;
@@ -14,9 +17,10 @@ mod xbel;
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use privacy::{DEFAULT_SENSITIVE_DOMAINS, PrivacyConfig, PrivacyEngine};
 use storage::{AppSummary, CategorySummary, OpenedFileRecord, TrackerDb, VisitedSiteRecord};
 use xbel::{default_xbel_path, parse_xbel_bytes};
 
@@ -31,6 +35,10 @@ struct Cli {
     /// Path to SQLite database (default: ~/.local/share/activity-tracker/activity.db)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+
+    /// Path to privacy & redaction JSON config (default: ~/.config/activity-tracker/privacy.json)
+    #[arg(long, global = true)]
+    privacy_config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -129,6 +137,80 @@ enum Commands {
     InstallService,
     /// Stop & remove systemd user service
     UninstallService,
+    /// Inspect or initialize the privacy & redaction config
+    Privacy {
+        #[command(subcommand)]
+        action: PrivacyAction,
+    },
+    /// Output privacy-filtered JSON digests, focus blocks, and search for LLMs
+    Llm {
+        #[command(subcommand)]
+        action: LlmAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LlmAction {
+    /// Compact activity digest (includes heuristic categories by default for smaller LLMs)
+    Digest {
+        #[arg(long)]
+        days: Option<i64>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        /// Omit heuristic categories (let capable LLMs classify from apps/titles/sites/files)
+        #[arg(long)]
+        no_classify: bool,
+    },
+    /// Merged focus blocks
+    Focus {
+        #[arg(long)]
+        days: Option<i64>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 30.0)]
+        min_sec: f64,
+        #[arg(long, default_value_t = 20.0)]
+        gap_sec: f64,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Omit heuristic categories
+        #[arg(long)]
+        no_classify: bool,
+    },
+    /// Search sessions, opened files, and visited websites by keyword
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrivacyAction {
+    /// Show the active privacy config and file path
+    Show,
+    /// Write a default privacy.json config file
+    Init {
+        /// Overwrite existing config file
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the built-in default sensitive domains
+    Domains,
+    /// Download premade open-source domain lists into ~/.config/activity-tracker/lists/
+    FetchLists {
+        /// Also download StevenBlack's adult/porn hosts list
+        #[arg(long)]
+        include_adult: bool,
+        /// Also download StevenBlack's gambling hosts list
+        #[arg(long)]
+        include_gambling: bool,
+    },
 }
 
 fn format_duration(seconds: f64) -> String {
@@ -494,6 +576,85 @@ fn cmd_uninstall_service() -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_privacy(privacy_path: Option<&Path>, action: PrivacyAction) -> Result<(), String> {
+    let engine = PrivacyEngine::load(privacy_path);
+    match action {
+        PrivacyAction::Show => {
+            println!("Config path: {}", engine.path().display());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(engine.config()).map_err(|e| e.to_string())?
+            );
+        }
+        PrivacyAction::Init { force } => {
+            let path = engine.path();
+            if path.exists() && !force {
+                return Err(format!(
+                    "{} already exists (pass --force to overwrite)",
+                    path.display()
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let json = serde_json::to_string_pretty(&PrivacyConfig::default())
+                .map_err(|e| e.to_string())?;
+            std::fs::write(path, format!("{json}\n")).map_err(|e| e.to_string())?;
+            println!("Wrote default privacy config to {}", path.display());
+        }
+        PrivacyAction::Domains => {
+            for d in DEFAULT_SENSITIVE_DOMAINS {
+                println!("{d}");
+            }
+        }
+        PrivacyAction::FetchLists {
+            include_adult,
+            include_gambling,
+        } => {
+            let lists_dir = privacy::default_lists_dir(engine.path());
+            std::fs::create_dir_all(&lists_dir).map_err(|e| e.to_string())?;
+
+            let mut sources: Vec<(&str, &str)> = vec![(
+                "misp-bank-website.json",
+                "https://raw.githubusercontent.com/MISP/misp-warninglists/main/lists/bank-website/list.json",
+            )];
+            if include_adult {
+                sources.push((
+                    "stevenblack-porn.hosts",
+                    "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts",
+                ));
+            }
+            if include_gambling {
+                sources.push((
+                    "stevenblack-gambling.hosts",
+                    "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling-only/hosts",
+                ));
+            }
+
+            for (filename, url) in sources {
+                let dest = lists_dir.join(filename);
+                println!("Fetching {url} -> {}", dest.display());
+                let status = Command::new("curl")
+                    .args(["-fsSL", url, "-o"])
+                    .arg(&dest)
+                    .status()
+                    .map_err(|e| format!("Failed to run curl: {e}"))?;
+                if !status.success() {
+                    return Err(format!("curl failed for {url} (exit {status})"));
+                }
+                let content = std::fs::read_to_string(&dest).map_err(|e| e.to_string())?;
+                let count = privacy::parse_domain_list_content(&content).len();
+                println!("  Loaded {count} domains from {filename}");
+            }
+            println!(
+                "Done! Lists in {} are auto-loaded when auto_load_lists_dir=true.",
+                lists_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
@@ -524,6 +685,7 @@ async fn main() -> Result<(), String> {
             });
             daemon::run_daemon(
                 cli.db.as_deref(),
+                cli.privacy_config.as_deref(),
                 verbose,
                 !no_proc_fallback,
                 web,
@@ -542,6 +704,7 @@ async fn main() -> Result<(), String> {
                 &addr,
                 web_ui::WebContext {
                     db_path,
+                    privacy_path: cli.privacy_config.clone(),
                     state: None,
                 },
             )
@@ -609,6 +772,64 @@ async fn main() -> Result<(), String> {
         }
         Commands::UninstallService => {
             cmd_uninstall_service()?;
+        }
+        Commands::Privacy { action } => {
+            cmd_privacy(cli.privacy_config.as_deref(), action)?;
+        }
+        Commands::Llm { action } => {
+            cmd_llm(cli.db.as_ref(), cli.privacy_config.as_deref(), action)?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_llm(
+    db_path: Option<&PathBuf>,
+    privacy_config: Option<&Path>,
+    action: LlmAction,
+) -> Result<(), String> {
+    let db = TrackerDb::open(db_path.map(|p| p.as_path())).map_err(|e| e.to_string())?;
+    let privacy = PrivacyEngine::load(privacy_config);
+
+    match action {
+        LlmAction::Digest {
+            days,
+            since,
+            top,
+            no_classify,
+        } => {
+            let (since_ts, until_ts) = resolve_time_range(days, since.as_deref())?;
+            let out = llm::build_digest(&db, &privacy, since_ts, until_ts, top, !no_classify)
+                .map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+        }
+        LlmAction::Focus {
+            days,
+            since,
+            min_sec,
+            gap_sec,
+            limit,
+            no_classify,
+        } => {
+            let (since_ts, until_ts) = resolve_time_range(days, since.as_deref())?;
+            let out = llm::build_focus_blocks(
+                &db,
+                &privacy,
+                since_ts,
+                until_ts,
+                min_sec,
+                gap_sec,
+                limit,
+                !no_classify,
+            )
+            .map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+        }
+        LlmAction::Search { query, days, limit } => {
+            let (since_ts, until_ts) = resolve_time_range(Some(days), None)?;
+            let out = llm::search_activity(&db, &privacy, &query, since_ts, until_ts, limit)
+                .map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
         }
     }
     Ok(())
