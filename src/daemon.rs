@@ -50,6 +50,7 @@ pub struct TrackerState {
     pub proc_fallback: bool,
     pub ff_cache: FirefoxSessionCache,
     pub remote_notify: Option<Arc<Notify>>,
+    pub last_heartbeat_at: f64,
 }
 
 impl TrackerState {
@@ -64,6 +65,7 @@ impl TrackerState {
             proc_fallback,
             ff_cache: FirefoxSessionCache::new(),
             remote_notify: None,
+            last_heartbeat_at: now_secs(),
         }
     }
 
@@ -218,6 +220,18 @@ impl TrackerState {
     }
 
     pub fn heartbeat(&mut self) {
+        let now = now_secs();
+        let prev = self.last_heartbeat_at;
+        self.last_heartbeat_at = now;
+
+        // Guard against laptop suspend/sleep: never stretch a session across a >20s heartbeat gap
+        if (now - prev) > 20.0 {
+            self.log(&format!("Detected {:.1}s gap (suspend/sleep); closing stale session", now - prev));
+            self.close_current_session(prev);
+            self.notify_remote();
+            return;
+        }
+
         if self.screen_locked || self.manually_paused {
             self.notify_remote();
             return;
@@ -226,7 +240,6 @@ impl TrackerState {
             self.notify_remote();
             return;
         };
-        let now = now_secs();
         let _ = self.db.update_session_end(cur.session_id, now);
         if let Some(visit) = detect_site_visit(&cur.app_name, &cur.window_title, &mut self.ff_cache) {
             let _ = self.db.record_site(
@@ -511,6 +524,15 @@ pub async fn run_daemon(
 
     // Heartbeat + signal handling
     let mut ticker = tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
+    let mut tick_count: u64 = 0;
+    let kwin_scripting_proxy = Proxy::new(
+        &conn,
+        "org.kde.KWin",
+        "/Scripting",
+        "org.kde.kwin.Scripting",
+    )
+    .await
+    .ok();
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|e| format!("Failed to register SIGTERM handler: {e}"))?;
@@ -518,8 +540,31 @@ pub async fn run_daemon(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                tick_count += 1;
                 if let Ok(mut guard) = state.lock() {
                     guard.heartbeat();
+                }
+                if tick_count % 3 == 0 {
+                    if let Some(ref kp) = kwin_scripting_proxy {
+                        let loaded = kp
+                            .call::<_, _, bool>("isScriptLoaded", &(KWIN_SCRIPT_NAME,))
+                            .await
+                            .unwrap_or(false);
+                        if !loaded {
+                            if let Ok(mut guard) = state.lock() {
+                                guard.close_current_session(now_secs());
+                            }
+                            match load_kwin_script(&js_path).await {
+                                Ok(id) if verbose => {
+                                    eprintln!("Reloaded KWin script {KWIN_SCRIPT_NAME} (id={id})");
+                                }
+                                Err(e) if verbose => {
+                                    eprintln!("Failed to reload KWin script: {e}");
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 if let Some(ref handle) = tray_handle {
                     handle.update(|_| {}).await;
