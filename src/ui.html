@@ -138,6 +138,15 @@
       word-break: break-all;
     }
     .muted { color: var(--muted); }
+    .notice {
+      background: rgba(245, 185, 113, 0.12);
+      border: 1px solid rgba(245, 185, 113, 0.45);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 0.9rem;
+    }
+    .notice strong { color: var(--warn); }
   </style>
 </head>
 <body>
@@ -162,6 +171,8 @@
       <input id="app-filter" type="text" placeholder="Filter by app name..." />
       <button id="refresh-btn">Refresh</button>
     </div>
+
+    <div id="llm-notice" class="notice" style="display:none;"></div>
 
     <div class="cards">
       <div class="card">
@@ -312,6 +323,28 @@
       ]);
       const rep = await repRes.json();
       const sessions = await sessRes.json();
+
+      const noticeEl = document.getElementById('llm-notice');
+      const lv = rep.llm_visibility;
+      if (lv && lv.sizable_hidden) {
+        if (!lv.llm_enabled) {
+          noticeEl.innerHTML = '<strong>Privacy Notice:</strong> LLM access is disabled in your privacy config — all tracked activity is hidden from LLMs.';
+        } else {
+          const parts = [];
+          if (lv.hidden_pct > 0) parts.push(`${lv.hidden_pct}% of tracked time (${fmtDur(lv.hidden_seconds)})`);
+          if (lv.hidden_sessions > 0) parts.push(`${lv.hidden_sessions} session(s)`);
+          if (lv.redacted_titles > 0) parts.push(`${lv.redacted_titles} redacted title(s)`);
+          if (lv.hidden_sites > 0) parts.push(`${lv.hidden_sites} site(s)`);
+          if (lv.hidden_files > 0) parts.push(`${lv.hidden_files} file(s)`);
+          const appsHint = (lv.hidden_apps && lv.hidden_apps.length)
+            ? ` (including ${lv.hidden_apps.map(esc).join(', ')})`
+            : '';
+          noticeEl.innerHTML = `<strong>LLM Privacy Filter:</strong> ${parts.join(', ')} hidden from LLMs${appsHint}.`;
+        }
+        noticeEl.style.display = 'block';
+      } else {
+        noticeEl.style.display = 'none';
+      }
 
       const total = rep.apps.reduce((acc, a) => acc + (a.total_sec || 0), 0);
       document.getElementById('stat-time').textContent = fmtDur(total);

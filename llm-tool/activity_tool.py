@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """Thin Python wrapper & tool interface over `activity-tracker llm`.
 
-All privacy filtering, domain/app/keyword redaction, and database queries live
-in the Rust `activity-tracker` binary so there is no duplicated logic.
-
 - Default (`classify=True`): includes heuristic categories for smaller/weaker LLMs.
 - `--no-classify` (`classify=False`): omits heuristic categories and includes
   sample window titles so larger LLMs can classify activity on their own.
@@ -38,18 +35,11 @@ def _find_binary() -> str:
     )
 
 
-def _run_cli(
-    subargs: list[str],
-    db_path: str | Path | None = None,
-    privacy_config: str | Path | None = None,
-) -> Any:
+def _run_cli(subargs: list[str], db_path: str | Path | None = None) -> Any:
     cmd = [_find_binary()]
     db = db_path or os.environ.get("ACTIVITY_TRACKER_DB")
     if db:
         cmd.extend(["--db", str(Path(db).expanduser())])
-    pcfg = privacy_config or os.environ.get("ACTIVITY_TRACKER_PRIVACY_CONFIG")
-    if pcfg:
-        cmd.extend(["--privacy-config", str(Path(pcfg).expanduser())])
     cmd.append("llm")
     cmd.extend(subargs)
 
@@ -63,9 +53,8 @@ def get_activity_digest(
     top_n: int = 10,
     db_path: str | Path | None = None,
     classify: bool = True,
-    privacy_config: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Return a compact, privacy-filtered JSON digest for LLMs."""
+    """Return a compact JSON activity digest for LLMs."""
     args = ["digest", "--top", str(top_n)]
     if days > 0:
         args.extend(["--days", str(days)])
@@ -73,7 +62,7 @@ def get_activity_digest(
         args.extend(["--since", since])
     if not classify:
         args.append("--no-classify")
-    return _run_cli(args, db_path=db_path, privacy_config=privacy_config)
+    return _run_cli(args, db_path=db_path)
 
 
 def get_focus_blocks(
@@ -84,9 +73,8 @@ def get_focus_blocks(
     limit: int = 25,
     db_path: str | Path | None = None,
     classify: bool = True,
-    privacy_config: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Return merged, privacy-filtered focus blocks."""
+    """Return merged focus blocks."""
     args = [
         "focus",
         "--min-sec", str(min_duration_sec),
@@ -99,7 +87,7 @@ def get_focus_blocks(
         args.extend(["--since", since])
     if not classify:
         args.append("--no-classify")
-    return _run_cli(args, db_path=db_path, privacy_config=privacy_config)
+    return _run_cli(args, db_path=db_path)
 
 
 def search_activity(
@@ -107,11 +95,10 @@ def search_activity(
     days: int = 7,
     limit: int = 15,
     db_path: str | Path | None = None,
-    privacy_config: str | Path | None = None,
 ) -> dict[str, Any]:
     """Search sessions, opened files, and visited websites by keyword."""
     args = ["search", "--query", query, "--days", str(days), "--limit", str(limit)]
-    return _run_cli(args, db_path=db_path, privacy_config=privacy_config)
+    return _run_cli(args, db_path=db_path)
 
 
 TOOL_DISPATCH = {
@@ -122,9 +109,8 @@ TOOL_DISPATCH = {
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Privacy-filtered activity data tool for LLMs")
+    parser = argparse.ArgumentParser(description="Compact activity data tool for LLMs")
     parser.add_argument("--db", help="Optional path to activity.db")
-    parser.add_argument("--privacy-config", help="Optional path to privacy.json")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_dig = sub.add_parser("digest", help="Compact app/site/file summary")
@@ -154,7 +140,6 @@ def main() -> int:
             top_n=args.top_n,
             db_path=args.db,
             classify=not args.no_classify,
-            privacy_config=args.privacy_config,
         )
     elif args.cmd == "focus-blocks":
         out = get_focus_blocks(
@@ -165,7 +150,6 @@ def main() -> int:
             limit=args.limit,
             db_path=args.db,
             classify=not args.no_classify,
-            privacy_config=args.privacy_config,
         )
     else:
         out = search_activity(
@@ -173,7 +157,6 @@ def main() -> int:
             days=args.days,
             limit=args.limit,
             db_path=args.db,
-            privacy_config=args.privacy_config,
         )
 
     print(json.dumps(out, indent=2))

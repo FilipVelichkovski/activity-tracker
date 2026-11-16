@@ -42,11 +42,26 @@ pub struct ReportQuery {
 }
 
 #[derive(Serialize)]
+pub struct LlmVisibilitySummary {
+    pub llm_enabled: bool,
+    pub total_seconds: f64,
+    pub hidden_seconds: f64,
+    pub hidden_pct: f64,
+    pub hidden_sessions: usize,
+    pub redacted_titles: usize,
+    pub hidden_sites: usize,
+    pub hidden_files: usize,
+    pub sizable_hidden: bool,
+    pub hidden_apps: Vec<String>,
+}
+
+#[derive(Serialize)]
 pub struct ReportResponse {
     pub categories: Vec<CategorySummary>,
     pub apps: Vec<AppSummary>,
     pub files: Vec<OpenedFileRecord>,
     pub sites: Vec<VisitedSiteRecord>,
+    pub llm_visibility: LlmVisibilitySummary,
 }
 
 #[derive(Deserialize)]
@@ -119,26 +134,113 @@ async fn api_status(State(ctx): State<WebContext>) -> Json<StatusResponse> {
     })
 }
 
+pub fn compute_llm_visibility(
+    db: &TrackerDb,
+    privacy: &PrivacyEngine,
+    since_ts: f64,
+    until_ts: f64,
+) -> Result<LlmVisibilitySummary, StatusCode> {
+    let llm_policy = privacy.sink_policy(Sink::Llm);
+    let llm_enabled = llm_policy.enabled;
+
+    let sessions = db
+        .query_sessions_in_range(since_ts, until_ts)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let files = db
+        .query_opened_files(since_ts, until_ts, None, 500)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sites = db
+        .query_visited_sites(since_ts, until_ts, None, 500)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut total_seconds = 0.0_f64;
+    let mut hidden_seconds = 0.0_f64;
+    let mut hidden_sessions = 0_usize;
+    let mut redacted_titles = 0_usize;
+    let total_sessions = sessions.len();
+    let mut hidden_app_secs: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    for s in sessions {
+        total_seconds += s.duration_sec;
+        let dec = privacy.evaluate_activity(Sink::Llm, &s.app_name, &s.window_title, "");
+        if !dec.allow {
+            hidden_seconds += s.duration_sec;
+            hidden_sessions += 1;
+            *hidden_app_secs.entry(s.app_name).or_insert(0.0) += s.duration_sec;
+        } else if !s.window_title.is_empty() && dec.window_title != s.window_title {
+            redacted_titles += 1;
+        }
+    }
+
+    let hidden_sites = sites
+        .iter()
+        .filter(|s| {
+            let dec = privacy.evaluate_activity(Sink::Llm, &s.app_name, &s.page_title, &s.domain);
+            !dec.allow || !dec.allow_sites
+        })
+        .count();
+
+    let hidden_files = files
+        .iter()
+        .filter(|f| {
+            let dec = privacy.evaluate_activity(Sink::Llm, &f.app_name, &f.file_path, "");
+            !dec.allow || !dec.allow_files
+        })
+        .count();
+
+    let hidden_pct = if total_seconds > 0.0 {
+        ((hidden_seconds / total_seconds) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let mut app_list: Vec<(String, f64)> = hidden_app_secs.into_iter().collect();
+    app_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let hidden_apps: Vec<String> = app_list.into_iter().take(5).map(|(a, _)| a).collect();
+
+    let sizable_hidden = (!llm_enabled && (total_seconds > 0.0 || !sites.is_empty() || !files.is_empty()))
+        || hidden_pct >= 10.0
+        || hidden_sites >= 3
+        || hidden_files >= 3
+        || (total_sessions > 0 && (redacted_titles as f64 / total_sessions as f64) >= 0.25);
+
+    Ok(LlmVisibilitySummary {
+        llm_enabled,
+        total_seconds,
+        hidden_seconds,
+        hidden_pct,
+        hidden_sessions,
+        redacted_titles,
+        hidden_sites,
+        hidden_files,
+        sizable_hidden,
+        hidden_apps,
+    })
+}
+
 async fn api_report(
     State(ctx): State<WebContext>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<ReportResponse>, StatusCode> {
     let privacy = PrivacyEngine::load(ctx.privacy_path.as_deref());
     let policy = privacy.sink_policy(Sink::Ui).clone();
+    let (since_ts, until_ts) = time_range_for_days(q.days);
+    let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let llm_visibility = compute_llm_visibility(&db, &privacy, since_ts, until_ts)?;
+
     if !policy.enabled {
         return Ok(Json(ReportResponse {
             categories: Vec::new(),
             apps: Vec::new(),
             files: Vec::new(),
             sites: Vec::new(),
+            llm_visibility,
         }));
     }
 
-    let (since_ts, until_ts) = time_range_for_days(q.days);
     let app_filter = q.app.as_deref().filter(|s| !s.trim().is_empty());
     let file_limit = q.file_limit.unwrap_or(100).clamp(1, 500);
 
-    let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let categories = if policy.include_category {
         db.query_category_summary(since_ts, until_ts, app_filter)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -206,6 +308,7 @@ async fn api_report(
         apps,
         files,
         sites,
+        llm_visibility,
     }))
 }
 
@@ -251,4 +354,37 @@ pub async fn serve_web_ui(bind_addr: &str, ctx: WebContext) -> Result<(), String
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("Web UI server error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::privacy::PrivacyConfig;
+
+    #[test]
+    fn llm_visibility_flags_sizable_hidden_chunk() {
+        let dir = std::env::temp_dir().join(format!("agy_webui_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("webui.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = TrackerDb::open_with_key(Some(&db_path), "webui-test-key-0123456789abcdef").unwrap();
+        let s1 = db.start_session("dev.zed.Zed", "main.rs", 10, 100.0).unwrap();
+        db.update_session_end(s1, 180.0).unwrap(); // 80s allowed
+        let s2 = db.start_session("com.bitwarden.desktop", "Bitwarden", 11, 200.0).unwrap();
+        db.update_session_end(s2, 220.0).unwrap(); // 20s hidden (20%)
+
+        let mut cfg = PrivacyConfig::default();
+        cfg.auto_load_lists_dir = false;
+        let privacy = PrivacyEngine::from_config(cfg);
+
+        let vis = compute_llm_visibility(&db, &privacy, 0.0, 500.0).unwrap();
+        assert!(vis.llm_enabled);
+        assert_eq!(vis.hidden_sessions, 1);
+        assert!((vis.hidden_pct - 20.0).abs() < 0.1);
+        assert!(vis.sizable_hidden);
+        assert_eq!(vis.hidden_apps, vec!["com.bitwarden.desktop"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
