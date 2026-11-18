@@ -54,6 +54,15 @@ const LEARNING_KEYWORDS: &[&str] = &[
     "netzwerk",
     "lecture",
     "homework",
+    "german",
+    "deutsch",
+    "onenote",
+    "analysis",
+    "discrete",
+    "calculus",
+    "linear algebra",
+    "mathematics",
+    "exam prep",
 ];
 
 const COMM_APPS: &[&str] = &[
@@ -118,36 +127,46 @@ pub fn classify_activity(app_name: &str, window_title: &str) -> &'static str {
     let app = app_name.to_lowercase();
     let title = window_title.to_lowercase();
 
-    if COMM_APPS.iter().any(|k| app.contains(k))
-        || title.contains("gmail")
-        || title.contains("proton mail")
-        || title.contains("meet.google")
-    {
-        return "Communication";
-    }
-
-    if DEV_APPS.iter().any(|k| app.contains(k))
-        || DEV_TITLE_KEYWORDS.iter().any(|k| title.contains(k))
-    {
-        return "Development";
-    }
-
-    if app.contains("okular")
-        || app.contains("zotero")
-        || LEARNING_KEYWORDS.iter().any(|k| title.contains(k))
-    {
+    // 1. Session title-based classification first (what the user is actually doing in the session)
+    if LEARNING_KEYWORDS.iter().any(|k| title.contains(k)) {
         return "Learning";
     }
 
-    if SOCIAL_KEYWORDS.iter().any(|k| title.contains(k) || app.contains(k)) {
+    if title.contains("gmail") || title.contains("proton mail") || title.contains("meet.google") {
+        return "Communication";
+    }
+
+    if SOCIAL_KEYWORDS.iter().any(|k| title.contains(k)) {
         return "Social";
     }
 
-    if MEDIA_APPS_OR_KEYWORDS
-        .iter()
-        .any(|k| app.contains(k) || title.contains(k))
-    {
+    if MEDIA_APPS_OR_KEYWORDS.iter().any(|k| title.contains(k)) {
         return "Media & Entertainment";
+    }
+
+    if DEV_TITLE_KEYWORDS.iter().any(|k| title.contains(k)) {
+        return "Development";
+    }
+
+    // 2. App-level fallback when window title has no specific topic signal
+    if COMM_APPS.iter().any(|k| app.contains(k)) {
+        return "Communication";
+    }
+
+    if app.contains("okular") || app.contains("zotero") || app.contains("rnote") || app.contains("xournal") {
+        return "Learning";
+    }
+
+    if SOCIAL_KEYWORDS.iter().any(|k| app.contains(k)) {
+        return "Social";
+    }
+
+    if MEDIA_APPS_OR_KEYWORDS.iter().any(|k| app.contains(k)) {
+        return "Media & Entertainment";
+    }
+
+    if DEV_APPS.iter().any(|k| app.contains(k)) {
+        return "Development";
     }
 
     if SYSTEM_APPS.iter().any(|k| app.contains(k)) {
@@ -170,6 +189,14 @@ mod tests {
         assert_eq!(
             classify_activity("dev.zed.Zed", "hw03 — variant.hpp"),
             "Development"
+        );
+        assert_eq!(
+            classify_activity("dev.zed.Zed", "onenote-export — german a2.2.md"),
+            "Learning"
+        );
+        assert_eq!(
+            classify_activity("com.github.flxzt.rnote", "analysis 7.rnote"),
+            "Learning"
         );
         assert_eq!(
             classify_activity("org.mozilla.firefox", "Jacobs Netzwerk A2.2 - Memrise — Mozilla Firefox"),

@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, Json};
 use axum::routing::get;
 use axum::Router;
-use chrono::{Duration, Local};
+use chrono::{Duration, Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,7 @@ pub struct StatusResponse {
 #[derive(Deserialize)]
 pub struct ReportQuery {
     pub days: Option<i64>,
+    pub date: Option<String>,
     pub app: Option<String>,
     pub file_limit: Option<i64>,
 }
@@ -67,20 +68,63 @@ pub struct ReportResponse {
 #[derive(Deserialize)]
 pub struct SessionsQuery {
     pub limit: Option<i64>,
+    pub date: Option<String>,
 }
 
-fn time_range_for_days(days: Option<i64>) -> (f64, f64) {
+#[derive(Deserialize)]
+pub struct WeekQuery {
+    pub end: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WeekDayCategory {
+    pub category: String,
+    pub total_sec: f64,
+}
+
+#[derive(Serialize)]
+pub struct WeekDaySummary {
+    pub date: String,
+    pub label: String,
+    pub total_sec: f64,
+    pub is_today: bool,
+    pub categories: Vec<WeekDayCategory>,
+}
+
+#[derive(Serialize)]
+pub struct WeekResponse {
+    pub start_date: String,
+    pub end_date: String,
+    pub days: Vec<WeekDaySummary>,
+}
+
+fn resolve_time_range(days: Option<i64>, date: Option<&str>) -> Result<(f64, f64), StatusCode> {
+    if let Some(d_str) = date.map(str::trim).filter(|s| !s.is_empty()) {
+        let d = NaiveDate::parse_from_str(d_str, "%Y-%m-%d").map_err(|_| StatusCode::BAD_REQUEST)?;
+        let start_naive = d.and_hms_opt(0, 0, 0).ok_or(StatusCode::BAD_REQUEST)?;
+        let start_dt = Local
+            .from_local_datetime(&start_naive)
+            .earliest()
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let end_naive = d.and_hms_opt(23, 59, 59).ok_or(StatusCode::BAD_REQUEST)?;
+        let end_dt = Local
+            .from_local_datetime(&end_naive)
+            .latest()
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        return Ok((start_dt.timestamp() as f64, (end_dt.timestamp() as f64) + 0.999));
+    }
+
     let now = Local::now();
     let until_ts = (now.timestamp_millis() as f64 / 1000.0) + 1.0;
     let since_ts = match days {
         Some(n) if n > 0 => (now - Duration::days(n)).timestamp() as f64,
         _ => {
             let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-            let midnight = chrono::TimeZone::from_local_datetime(&Local, &today).unwrap();
+            let midnight = Local.from_local_datetime(&today).unwrap();
             midnight.timestamp() as f64
         }
     };
-    (since_ts, until_ts)
+    Ok((since_ts, until_ts))
 }
 
 async fn index() -> Html<&'static str> {
@@ -224,7 +268,7 @@ async fn api_report(
 ) -> Result<Json<ReportResponse>, StatusCode> {
     let privacy = PrivacyEngine::load(ctx.privacy_path.as_deref());
     let policy = privacy.sink_policy(Sink::Ui).clone();
-    let (since_ts, until_ts) = time_range_for_days(q.days);
+    let (since_ts, until_ts) = resolve_time_range(q.days, q.date.as_deref())?;
     let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let llm_visibility = compute_llm_visibility(&db, &privacy, since_ts, until_ts)?;
 
@@ -322,9 +366,19 @@ async fn api_sessions(
     }
     let limit = q.limit.unwrap_or(30).clamp(1, 200);
     let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let sessions = db
-        .query_recent_sessions(limit)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    let raw_sessions = if let Some(d_str) = q.date.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let (since_ts, until_ts) = resolve_time_range(None, Some(d_str))?;
+        let mut list = db
+            .query_sessions_in_range(since_ts, until_ts)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        list.reverse();
+        list.truncate(limit as usize);
+        list
+    } else {
+        db.query_recent_sessions(limit)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+    let sessions = raw_sessions
         .into_iter()
         .filter_map(|mut s| {
             let d = privacy.evaluate_activity(Sink::Ui, &s.app_name, &s.window_title, "");
@@ -339,12 +393,75 @@ async fn api_sessions(
     Ok(Json(sessions))
 }
 
+async fn api_week(
+    State(ctx): State<WebContext>,
+    Query(q): Query<WeekQuery>,
+) -> Result<Json<WeekResponse>, StatusCode> {
+    let privacy = PrivacyEngine::load(ctx.privacy_path.as_deref());
+    let today = Local::now().date_naive();
+    let end_date = match q.end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => today,
+    };
+    let start_date = end_date - Duration::days(6);
+
+    let ui_enabled = privacy.sink_policy(Sink::Ui).enabled;
+    let db = TrackerDb::open(Some(&ctx.db_path)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut days = Vec::with_capacity(7);
+
+    for offset in 0..7 {
+        let d = start_date + Duration::days(offset);
+        let d_str = d.format("%Y-%m-%d").to_string();
+        let mut total_sec = 0.0_f64;
+        let mut cat_map: std::collections::HashMap<&'static str, f64> = std::collections::HashMap::new();
+
+        if ui_enabled {
+            let (since_ts, until_ts) = resolve_time_range(None, Some(&d_str))?;
+            let sessions = db
+                .query_sessions_in_range(since_ts, until_ts)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            for s in sessions {
+                let dec = privacy.evaluate_activity(Sink::Ui, &s.app_name, &s.window_title, "");
+                if dec.allow {
+                    total_sec += s.duration_sec;
+                    let cat = crate::categorizer::classify_activity(&dec.app_name, &dec.window_title);
+                    *cat_map.entry(cat).or_insert(0.0) += s.duration_sec;
+                }
+            }
+        }
+
+        let mut categories: Vec<WeekDayCategory> = cat_map
+            .into_iter()
+            .map(|(category, total_sec)| WeekDayCategory {
+                category: category.to_string(),
+                total_sec,
+            })
+            .collect();
+        categories.sort_by(|a, b| b.total_sec.total_cmp(&a.total_sec));
+
+        days.push(WeekDaySummary {
+            date: d_str,
+            label: d.format("%a").to_string(),
+            total_sec,
+            is_today: d == today,
+            categories,
+        });
+    }
+
+    Ok(Json(WeekResponse {
+        start_date: start_date.format("%Y-%m-%d").to_string(),
+        end_date: end_date.format("%Y-%m-%d").to_string(),
+        days,
+    }))
+}
+
 pub async fn serve_web_ui(bind_addr: &str, ctx: WebContext) -> Result<(), String> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/status", get(api_status))
         .route("/api/report", get(api_report))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/week", get(api_week))
         .with_state(ctx);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
