@@ -1,5 +1,10 @@
 # KDE Wayland Activity & Opened File Tracker (Rust)
 
+![AI-Generated](https://img.shields.io/badge/AI--Generated-LLM%20Code-blue)
+
+> [!NOTE]
+> **AI-Generated Code:** This repository and its codebase were generated with an LLM.
+
 Tracks active, **non-minimized** application time and opened user files on KDE Plasma (Wayland / KWin 6), storing everything locally in SQLite (`~/.local/share/activity-tracker/activity.db`).
 
 ## How It Works
