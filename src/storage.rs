@@ -393,7 +393,7 @@ impl TrackerDb {
                AND (?3 IS NULL OR LOWER(app_name) LIKE ?3)",
         )?;
 
-        let mut agg: HashMap<&'static str, (f64, i64, HashSet<String>)> = HashMap::new();
+        let mut agg: HashMap<String, (f64, i64, HashSet<String>)> = HashMap::new();
         let rows = stmt.query_map(params![since_ts, until_ts, filter_pattern], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -414,7 +414,7 @@ impl TrackerDb {
         let mut out: Vec<CategorySummary> = agg
             .into_iter()
             .map(|(cat, (total_sec, session_count, apps))| CategorySummary {
-                category: cat.to_string(),
+                category: cat,
                 total_sec,
                 session_count,
                 app_count: apps.len() as i64,

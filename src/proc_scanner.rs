@@ -196,14 +196,14 @@ mod tests {
 
     #[test]
     fn filters_app_internals_and_keeps_user_files() {
-        assert!(is_relevant_file("/var/home/silver/repos/hw03/variant.hpp"));
-        assert!(is_relevant_file("/var/home/silver/Documents/report.pdf"));
+        assert!(is_relevant_file("/home/user/repos/my-app/main.rs"));
+        assert!(is_relevant_file("/home/user/Documents/report.pdf"));
 
         assert!(!is_relevant_file("pipe:[1234]"));
         assert!(!is_relevant_file("/usr/lib64/libc.so.6"));
-        assert!(!is_relevant_file("/var/home/silver/.config/Antigravity/Cookies"));
-        assert!(!is_relevant_file("/var/home/silver/.local/share/zed/threads/threads.db"));
-        assert!(!is_relevant_file("/var/home/silver/.var/app/com.discordapp.Discord/config/discord/MANIFEST-000001"));
-        assert!(!is_relevant_file("/tmp/agy_acp_server.par.fedora-yoga.silver.log.INFO.123"));
+        assert!(!is_relevant_file("/home/user/.config/Antigravity/Cookies"));
+        assert!(!is_relevant_file("/home/user/.local/share/zed/threads/threads.db"));
+        assert!(!is_relevant_file("/home/user/.var/app/com.discordapp.Discord/config/discord/MANIFEST-000001"));
+        assert!(!is_relevant_file("/tmp/app.par.workstation.user.log.INFO.123"));
     }
 }

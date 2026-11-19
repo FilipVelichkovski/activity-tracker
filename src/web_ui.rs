@@ -413,7 +413,7 @@ async fn api_week(
         let d = start_date + Duration::days(offset);
         let d_str = d.format("%Y-%m-%d").to_string();
         let mut total_sec = 0.0_f64;
-        let mut cat_map: std::collections::HashMap<&'static str, f64> = std::collections::HashMap::new();
+        let mut cat_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
         if ui_enabled {
             let (since_ts, until_ts) = resolve_time_range(None, Some(&d_str))?;
@@ -433,7 +433,7 @@ async fn api_week(
         let mut categories: Vec<WeekDayCategory> = cat_map
             .into_iter()
             .map(|(category, total_sec)| WeekDayCategory {
-                category: category.to_string(),
+                category,
                 total_sec,
             })
             .collect();

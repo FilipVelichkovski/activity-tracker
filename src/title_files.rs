@@ -166,10 +166,10 @@ mod tests {
 
     #[test]
     fn parses_zed_and_kate_titles() {
-        let zed = extract_file_from_title("dev.zed.Zed", "hw03-variant-filip-velichkovski-398 — variant.hpp");
+        let zed = extract_file_from_title("dev.zed.Zed", "my-project — main.rs");
         assert!(zed.is_some());
         let (path, _) = zed.unwrap();
-        assert!(path.ends_with("variant.hpp"));
+        assert!(path.ends_with("main.rs"));
 
         let kate = extract_file_from_title("org.kde.kate", "main.cpp [*] — Kate");
         assert_eq!(kate.as_ref().map(|(p, _)| p.as_str()), Some("main.cpp"));

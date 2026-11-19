@@ -65,16 +65,16 @@ mod tests {
     #[test]
     fn decodes_file_uris_and_filters_non_files() {
         assert_eq!(
-            normalize_file_uri("file:///var/home/silver/My%20Doc.pdf").as_deref(),
-            Some("/var/home/silver/My Doc.pdf")
+            normalize_file_uri("file:///home/user/My%20Doc.pdf").as_deref(),
+            Some("/home/user/My Doc.pdf")
         );
         assert_eq!(
             normalize_file_uri("file://localhost/tmp/test.txt").as_deref(),
             Some("/tmp/test.txt")
         );
         assert_eq!(
-            normalize_file_uri("/home/silver/notes.md").as_deref(),
-            Some("/home/silver/notes.md")
+            normalize_file_uri("/home/user/notes.md").as_deref(),
+            Some("/home/user/notes.md")
         );
         assert_eq!(normalize_file_uri("https://example.com"), None);
         assert_eq!(normalize_file_uri("applications:org.kde.kate.desktop"), None);

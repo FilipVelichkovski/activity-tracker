@@ -7,6 +7,8 @@
 
 Tracks active, **non-minimized** application time and opened user files on KDE Plasma (Wayland / KWin 6), storing everything locally in SQLite (`~/.local/share/activity-tracker/activity.db`).
 
+![Activity Tracker Web UI](docs/screenshot.png)
+
 ## How It Works
 - **Window & Minimize Tracking (`kwin_bridge.js` -> `src/daemon.rs`)**: Loads a KWin 6 script that listens to `workspace.windowActivated`, `minimizedChanged`, `captionChanged`, and `showingDesktopChanged`. Only when a window is active, not minimized, and not hidden by Show Desktop is it counted.
 - **Screen Lock Detection (`src/daemon.rs`)**: Subscribes to `org.freedesktop.ScreenSaver` `ActiveChanged` so locked/idle screen time is excluded.
@@ -82,6 +84,7 @@ Activity Tracker includes a runtime-hot-reloaded privacy pipeline (`~/.config/ac
 - **Per-sink controls (`storage`, `ui`, `remote`, `llm`)**: Independently toggle `enabled`, `include_app`, `include_title`, `include_files`, `include_sites`, and `include_category` (e.g., save only app + category to SQLite, show full details in local UI, send only category to the remote server, and hide or redact for `llm-tool/activity_tool.py`).
 - **Premade & default sensitive domain lists**: Supports loading external premade lists (`sensitive_domain_files` or auto-loading `~/.config/activity-tracker/lists/*`) in **MISP warninglist JSON** (`MISP/misp-warninglists` `bank-website/list.json`), **hosts-file** (`StevenBlack/hosts`), **Adblock** (`||domain^`), or plain text formats—combined with a built-in default list, `sensitive_domains` additions, and `allow_domains` overrides (`sensitive_domain_action`: `"ignore"` or `"redact"`).
 - **Per-app/title/domain/category rules**: Override any sink or all sinks per rule.
+- **Custom activity categories (`~/.config/activity-tracker/categories.json`)**: Optionally define custom `rules` (`category`, `title_keywords`, `app_keywords`) to override the built-in categorizer (hot-reloaded automatically; override path with `ACTIVITY_TRACKER_CATEGORIES_CONFIG`).
 - **Reporter plugins (`plugins.discord_rpc`)**: Disabled by default. When enabled, operates as a strict whitelist (`hide_by_default: true`, `show_title: false`) over Discord's local IPC socket (`discord-ipc-0`), hiding/clearing presence for any app or category not in `allowed_apps` / `allowed_categories`.
 
 

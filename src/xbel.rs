@@ -180,7 +180,7 @@ mod tests {
     fn parses_xbel_bookmarks_and_apps() {
         let sample = br#"<?xml version="1.0" encoding="UTF-8"?>
 <xbel version="1.0" xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks">
-  <bookmark href="file:///var/home/silver/My%20Notes.md" added="2026-11-15T10:00:00Z" modified="2026-11-15T10:05:00Z">
+  <bookmark href="file:///home/user/My%20Notes.md" added="2026-11-15T10:00:00Z" modified="2026-11-15T10:05:00Z">
     <info>
       <metadata owner="http://freedesktop.org">
         <bookmark:applications>
@@ -194,7 +194,7 @@ mod tests {
         let entries = parse_xbel_bytes(sample);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].app_name, "org.kde.kate");
-        assert_eq!(entries[0].file_path, "/var/home/silver/My Notes.md");
+        assert_eq!(entries[0].file_path, "/home/user/My Notes.md");
         assert!(entries[0].modified_ts > 0.0);
     }
 }

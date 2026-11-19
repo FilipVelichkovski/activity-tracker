@@ -238,8 +238,8 @@ mod tests {
         );
         assert_eq!(extract_domain("http://127.0.0.1:7878/"), "127.0.0.1");
         assert_eq!(
-            strip_browser_suffix("Discover — Witchsky — Mozilla Firefox"),
-            "Discover — Witchsky"
+            strip_browser_suffix("Example Page — Mozilla Firefox"),
+            "Example Page"
         );
     }
 }
